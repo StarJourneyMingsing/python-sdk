@@ -38,6 +38,7 @@ from typing import (
 
 from google.protobuf.any_pb2 import Any as GrpcAny
 from google.protobuf.message import Message as GrpcMessage
+from grpc import StatusCode, RpcError, Call
 
 from dapr.clients._constants import DEFAULT_JSON_CONTENT_TYPE
 from dapr.clients.grpc._helpers import (
@@ -48,6 +49,10 @@ from dapr.clients.grpc._helpers import (
     tuple_to_dict,
     unpack,
     WorkflowRuntimeStatus,
+)
+from dapr.clients.health import DaprHealth
+from dapr.common.pubsub.subscription import (
+    StreamInactiveError,
 )
 from dapr.proto import api_service_v1, api_v1, appcallback_v1, common_v1
 
@@ -677,6 +682,11 @@ class ConfigurationWatcher:
         self.keys = None
         self.event: threading.Event = threading.Event()
         self.id: str = ''
+        self._stream: Optional[Call] = None
+        self._stream_active: bool = False
+        self._stub = None
+        self._handler = None
+        self._config_metadata = None
 
     def watch_configuration(
         self,
@@ -684,12 +694,19 @@ class ConfigurationWatcher:
         store_name: str,
         keys: List[str],
         handler: Callable[[Text, ConfigurationResponse], None],
-        config_metadata: Optional[Dict[str, str]] = dict(),
+        config_metadata=None,
     ):
-        req = api_v1.SubscribeConfigurationRequest(
-            store_name=store_name, keys=keys, metadata=config_metadata
+        """Start the configuration subscription stream."""
+        self._stub = stub
+        self._handler = handler
+        self._config_metadata = config_metadata
+        self.keys = keys
+        self.store_name = store_name
+
+        # Start the reading thread
+        thread = threading.Thread(
+            target=self._read_subscribe_config,
         )
-        thread = threading.Thread(target=self._read_subscribe_config, args=(stub, req, handler))
         thread.daemon = True
         thread.start()
         self.keys = keys
@@ -700,27 +717,105 @@ class ConfigurationWatcher:
             return None
         return self.id
 
-    def _read_subscribe_config(
-        self,
-        stub: api_service_v1.DaprStub,
-        req: api_v1.SubscribeConfigurationRequest,
-        handler: Callable[[Text, ConfigurationResponse], None],
-    ):
+    def _read_subscribe_config(self):
+        # Create new request with subscription ID for resumption
+        req = api_v1.SubscribeConfigurationRequest(
+            store_name=self.store_name, keys=self.keys, metadata=self._config_metadata or {}
+        )
+        if self.id and self.id != '':
+            req.metadata['subscription-id'] = self.id
+
+        # Start the stream again
+        self._stream = self._stub.SubscribeConfigurationAlpha1(req)
+        self._set_stream_active()
+
+        # Read configuration responses from the stream with improved error detection.
+        if not self._is_stream_active() or self._stream is None:
+            raise StreamInactiveError('Stream is not active')
+
         try:
-            responses: List[
-                api_v1.SubscribeConfigurationResponse
-            ] = stub.SubscribeConfigurationAlpha1(req)
-            isFirst = True
-            for response in responses:
-                if isFirst:
-                    self.id = response.id
-                    self.event.set()
-                    isFirst = False
-                if len(response.items) > 0:
-                    handler(response.id, ConfigurationResponse(response.items))
-        except Exception:
-            print(f'{self.store_name} configuration watcher for keys ' f'{self.keys} stopped.')
-            pass
+            is_first = True
+            # Use a more robust approach to detect stream closure
+            while self._is_stream_active():
+                try:
+                    response = next(self._stream)
+
+                    if is_first:
+                        self.id = response.id
+                        self.event.set()
+                        is_first = False
+
+                    if len(response.items) > 0:
+                        self._handler(response.id, ConfigurationResponse(response.items))
+                except Exception as e:
+                    raise e
+        except RpcError as e:
+            if hasattr(e, 'code') and hasattr(e, 'details'):
+                # If Dapr can't be reached, wait until it's ready and reconnect the stream
+                if e.code() == StatusCode.UNAVAILABLE or e.code() == StatusCode.UNKNOWN:
+                    print(
+                        f'gRPC error while reading subscribe config: {e.details()}, '
+                        f'Status Code: {e.code()}. '
+                        f'Attempting to reconnect...'
+                    )
+                    self._reconnect_stream()
+                elif e.code() == StatusCode.CANCELLED:
+                    print('Configuration stream was cancelled')
+                elif e.code() == StatusCode.DEADLINE_EXCEEDED:
+                    print(
+                        'Configuration stream timeout - server may be unresponsive',
+                        'Attempting to reconnect...',
+                    )
+                    self._reconnect_stream()
+                else:
+                    print(
+                        f'gRPC error while reading configuration stream: {e.details()} '
+                        f'Status Code: {e.code()}'
+                    )
+            else:
+                print('Error while fetching configuration', e)
+        except StopIteration:
+            print(
+                'Unexpected StopIteration while reading configuration stream',
+                'Attempting to reconnect...',
+            )
+            self._reconnect_stream()
+        except Exception as e:
+            print(f'Error while fetching configuration: {e}')
+        finally:
+            self.close()
+            print(f'Configuration watcher for keys {self.keys} stopped.')
+
+    def _reconnect_stream(self):
+        """Reconnect the configuration subscription stream."""
+        try:
+            self.close()
+            DaprHealth.wait_until_ready()
+            print(f'Attempting to reconnect configuration for keys {self.keys}...')
+            self._read_subscribe_config()
+        except Exception as e:
+            print(f'Failed to resubscribe configuration for keys {self.keys}: {e}"')
+
+    def _set_stream_active(self):
+        """Set the stream as active."""
+        self._stream_active = True
+
+    def _set_stream_inactive(self):
+        """Set the stream as inactive."""
+        self._stream_active = False
+
+    def _is_stream_active(self):
+        """Check if the stream is active."""
+        return self._stream_active
+
+    def close(self):
+        """Close the configuration subscription stream."""
+        if self._stream:
+            try:
+                self._stream.cancel()
+                self._set_stream_inactive()
+            except Exception as e:
+                raise Exception(f'Error while closing configuration stream: {e}')
 
 
 class TopicEventResponseStatus(Enum):
